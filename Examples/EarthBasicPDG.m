@@ -32,10 +32,11 @@ SCP.TrustRegionNorm = 1; % Norm to evaluate trust region
 SCP.alphax = 1;
 SCP.alphau = 1;
 SCP.alphap = 1;
+SCP.alphah = 1;
 % Sub Integration Values:
 SCP.Nsub = 20; 
 % Convergence Tolerance:
-SCP.Tolerance = 1;
+SCP.Tolerance = .01;
 SCP.InfeasibilityTolerance = 10^-3;
 SCP.MaximumIterationCount = 50;
 % Time:
@@ -44,10 +45,12 @@ SCP.AdaptiveMesh = false;
 % Optimizer Saving:
 SCP.RegenerateOptimizer = true;
 SCP.OptimizerName = 'SixDoFPDG';
+% Discretization:
+SCP.Discretization = 'FOH';
 
 % Boundary Conditions:
-System.r0 = [0;200;200]; % Initial Position [m]
-System.v0 = [-50;-100;-50]; % Initial Velocity [m/s]
+System.r0 = [0;200;300]; % Initial Position [m]
+System.v0 = [-40;0;-40]; % Initial Velocity [m/s]
 System.q0 = eul2quat([0,0,0])'; % Initial Orientation
 System.w0 = [0;0;0]; % Initial Rotational Rate [rad/s]
 System.rf = [0;0;0]; % Initial Position [m]
@@ -86,9 +89,10 @@ N = 30; % Nodes
 InitialGuess.x = System.x0*linspace(1,0,N) + [System.xf;System.DryMass]*linspace(0,1,N);
 InitialGuess.u = (System.MaximumThrust-System.MinimumThrust)/2*[0;0;1;1]*ones(1,N);
 InitialGuess.p = t;
+InitialGuess.h = zeros(0,N);
 
 % Call Sequential Convex Program
-[Solution] = SCvx(SCP,System,InitialGuess,@Variables,@Cost,@Dynamics,@ConvexConstraints,@NonConvexConstraints,@InitialCondition,@FinalCondition,@Scaling,@Continuation);
+[Solution] = SCvx(SCP,System,InitialGuess,@Variables,@Cost,@Dynamics,@Convexities,@NonConvexConstraints,@InitialCondition,@FinalCondition,@Scaling,@Continuation);
 
 for i = 1:length(Solution)
     x(:,:,i) = Solution{i}.x;
@@ -103,7 +107,7 @@ PlotRocket(System,x(:,:,end),u(:,:,end));
 
 end
 
-function [x,u,c] = Variables(System)
+function [x,u,p,h,c] = Variables(System)
 
 % Create Symbolic State Variable:
 syms rx ry rz vx vy vz q0 q1 q2 q3 w1 w2 w3 m;
@@ -113,8 +117,15 @@ x = [rx;ry;rz;vx;vy;vz;q0;q1;q2;q3;w1;w2;w3;m];
 syms u1 u2 u3 u4;
 u = [u1;u2;u3;u4];
 
+% Create Symbolic Parameter Variable:
+syms t;
+p = [t];
+
+% Create Symbolic Time Varying Parameter Variable:
+h = [];
+
 % Create Symbolic Continuation Variable:
-c = sym([]);
+c = [];
 
 end
 
@@ -126,17 +137,17 @@ end
 %  Output:
 %    phi - Terminal Cost
 %    L - Running Cost
-function [phi,L] = Cost(System,t,x,u,c)
+function [phi,L] = Cost(System,x,u,p,h,c)
 
 % Terminal Cost:
-phi = -x(14); % Minimize Fuel
+phi = -100*x(14); % Minimize Fuel
 
 % Running Cost:
-L = sym(0); 
+L = 0; 
 
 end
 
-function [f,slack] = Dynamics(System,x,u,c)
+function [f,g,slack] = Dynamics(System,x,u,p,h,c)
 
 % Rotation Matrices:
 TB2L = @(q) [1-2*(q(3)^2+q(4)^2) 2*(q(2)*q(3)+q(4)*q(1)) 2*(q(2)*q(4)-q(3)*q(1));
@@ -159,56 +170,67 @@ m = x(14);
 F = u(1:3);
 M = cross([0;0;-System.GimbaltoCOMDistance],F);
 
-f = [v;
-     TB2L(q)*F/m + [0;0;-System.g];
-     1/2*Omega(w)*q;
-     System.InertiaTensor^-1*M-System.InertiaTensor^-1*(cross(w,System.InertiaTensor*w));
-     -System.alpha*u(4)];
+% Dynamics:
+f = p(1)*[v;
+         TB2L(q)*F/m + [0;0;-System.g];
+         1/2*Omega(w)*q;
+         System.InertiaTensor^-1*M-cross(w,w);%System.InertiaTensor^-1*(cross(w,System.InertiaTensor*w));
+         -System.alpha*u(4)];
+
+% Disturbance
+g = zeros(14,0);
 
 % Define Variables that can be slackened
 slack = [x(1:13)];
 
 end
 
-function [g0] = InitialCondition(System,x0,c)
+function [g0] = InitialCondition(System,x0,u0,p,h0,c)
 
 g0 = x0(1:14) - System.x0;
 
 end
 
-function [gf] = FinalCondition(System,xf,c)
+function [gf] = FinalCondition(System,xf,uf,p,hf,c)
 
 gf = xf(1:13) - System.xf;
 
 end
 
-function [Constraints] = ConvexConstraints(System,x,u,c)
+function [Constraints,Objective,Vars] = Convexities(System,x,u,p,h,c,Vars)
 
-% State Vectors:
-r = x(1:3);
-v = x(4:6);
-q = x(7:10);
-w = x(11:13);
-m = x(14);
+Constraints = [];
 
-% Nonconvex Inequality Constraint (s <= 0):
-Constraints = [m >= System.DryMass; % Mass Constraint
-               norm(r,2) <= tand(System.GlidescopeAngle)*r(3); % Glidescope Constraint
-               norm(w,2) <= System.MaximumRotationalRate; % Rotational Rate Constraint
-               norm(v,2) <= System.MaximumVelocity; % Velocity Constraint
-               norm(u(1:2),2) <= tand(System.MaximumGimbalAngle)*u(3); % Gimbal Constraint
-               norm(q(2:3),2) <= sqrt((1-cosd(System.MaximumPointingAngle))/2); % Pointing Angle Constraint
-               norm(u(1:3),2) <= u(4); % Slack Thrust Constraint
-               u(4) <= System.MaximumThrust; % Maximum Thrust Constraint
-               System.MinimumThrust <= u(4); % Minimum Thrust Constraint
-               ];
+for k = 1:size(x,2)
+    % State Vectors:
+    r = x(1:3,k);
+    v = x(4:6,k);
+    q = x(7:10,k);
+    w = x(11:13,k);
+    m = x(14,k);
+    
+    % Nonconvex Inequality Constraint (s <= 0):
+    Constraints = [Constraints;
+                   m >= System.DryMass; % Mass Constraint
+                   norm(r,2) <= tand(System.GlidescopeAngle)*r(3); % Glidescope Constraint
+                   norm(w,2) <= System.MaximumRotationalRate; % Rotational Rate Constraint
+                   norm(v,2) <= System.MaximumVelocity; % Velocity Constraint
+                   norm(u(1:2,k),2) <= tand(System.MaximumGimbalAngle)*u(3,k); % Gimbal Constraint
+                   norm(q(2:3),2) <= sqrt((1-cosd(System.MaximumPointingAngle))/2); % Pointing Angle Constraint
+                   norm(u(1:3,k),2) <= u(4,k); % Slack Thrust Constraint
+                   u(4,k) <= System.MaximumThrust; % Maximum Thrust Constraint
+                   System.MinimumThrust <= u(4,k); % Minimum Thrust Constraint
+                   ];
+end
+
+Objective = 0;
 
 end
 
-function [s] = NonConvexConstraints(System,x,u,c)
+function [s] = NonConvexConstraints(System,x,u,p,h,c)
 
 % Nonconvex Inequality Constraint (s <= 0):
-s = [];
+s = [System.MinimumThrust^2 - (u(1)^2+u(2)^2+u(3)^2)];
 
 end
 
@@ -224,7 +246,7 @@ end
 %    umax - Maximum Input Vector
 %    pmin - Minimum Parameter Vector
 %    pmax - Maximum Parameter Vector
-function [xmin,xmax,umin,umax] = Scaling(System)
+function [xmin,xmax,umin,umax,pmin,pmax,hmin,hmax] = Scaling(System)
 
 % State Scaling Limits
 xmin = [min(System.r0,System.rf);
@@ -249,6 +271,14 @@ umax = [System.MaximumThrust;
         System.MaximumThrust;
         System.MaximumThrust;
         System.MaximumThrust];
+
+% Parameter Scaling Limits
+pmin = [0];
+pmax = [1];
+
+% Time-varying Parameter Scaling Limits
+hmin = zeros(0,1);
+hmax = zeros(0,1);
 
 end
 

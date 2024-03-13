@@ -19,7 +19,7 @@ S.MinimumThrust = 320000; % N
 
 % Rates:
 S.MaximumRotationalRate = 90*pi/180; % rad/s
-S.MaximumVelocity = 100; % m/s
+S.MaximumVelocity = 125; % m/s
 
 % Environment:
 S.g = 9.81;

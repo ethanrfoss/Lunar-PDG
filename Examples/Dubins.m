@@ -1,8 +1,8 @@
 function Dubins
 
 % Add SCP Path:
-addpath('../Numerical Methods/Sequential Convex Programming/SCvx');
-addpath('../Numerical Methods/Sequential Convex Programming/SCP Functions');
+addpath('../Sequential Convex Programming/SCvx');
+addpath('..//Sequential Convex Programming/SCP Functions');
 % Plotting:
 addpath('../Plotting');
 
@@ -14,11 +14,11 @@ System.MinimumDistance = -10;
 System.CarRadius = .5;
 
 % Obstacles:
-System.Obstacles(1).p = [5;4];
+System.Obstacles(1).p = [4;5];
 System.Obstacles(1).r = 3;
-System.Obstacles(2).p = [-5;-4];
+System.Obstacles(2).p = [-4;-5];
 System.Obstacles(2).r = 3;
-System.Obstacles(3).p = [0;0];
+System.Obstacles(3).p = [1;-1];
 System.Obstacles(3).r = 2;
 
 % Sequential Convex Program Variables:
@@ -42,6 +42,7 @@ SCP.TrustRegionNorm = 1; % Norm to evaluate trust region
 SCP.alphax = 1;
 SCP.alphau = 1;
 SCP.alphap = 1;
+SCP.alphah = 0;
 % Sub Integration Values:
 SCP.Nsub = 20; 
 % Convergence Tolerance:
@@ -54,6 +55,8 @@ SCP.AdaptiveMesh = false;
 % Optimizer Saving:
 SCP.RegenerateOptimizer = true;
 SCP.OptimizerName = 'DubinsCar';
+% Discretization:
+SCP.Discretization = 'FOH';
 
 % Boundary Conditions:
 System.x0 = [-8;-8;0];
@@ -85,9 +88,10 @@ N = 30; % Nodes
 InitialGuess.x = System.x0*linspace(1,0,N) + System.xf*linspace(0,1,N);
 InitialGuess.u = zeros(2,N);
 InitialGuess.p = t;
+InitialGuess.h = zeros(0,N);
 
 % Call Sequential Convex Program
-[Solution] = SCvx(SCP,System,InitialGuess,@Variables,@Cost,@Dynamics,@ConvexConstraints,@NonConvexConstraints,@InitialCondition,@FinalCondition,@Scaling,@Continuation);
+[Solution] = SCvx(SCP,System,InitialGuess,@Variables,@Cost,@Dynamics,@Convexities,@NonConvexConstraints,@InitialCondition,@FinalCondition,@Scaling,@Continuation);
 
 for i = 1:length(Solution)
     x(:,:,i) = Solution{i}.x;
@@ -104,11 +108,17 @@ System.MaximumDistance = System.MaximumDistance*rs;
 System.MinimumDistance = System.MinimumDistance*rs;
 Boundary = [System.MinimumDistance System.MinimumDistance System.MaximumDistance System.MaximumDistance;
             System.MinimumDistance System.MaximumDistance System.MaximumDistance System.MinimumDistance];
+System.Obstacles(1).p = System.Obstacles(1).p*rs;
+System.Obstacles(1).r = System.Obstacles(1).r*rs;
+System.Obstacles(2).p = System.Obstacles(2).p*rs;
+System.Obstacles(2).r = System.Obstacles(2).r*rs;
+System.Obstacles(3).p = System.Obstacles(3).p*rs;
+System.Obstacles(3).r = System.Obstacles(3).r*rs;
 PlotDubins(System,Boundary,x(:,:,end))
 
 end
 
-function [x,u,c] = Variables(System)
+function [x,u,p,h,c] = Variables(System)
 
 % Create Symbolic State Variable:
 syms x y theta;
@@ -118,8 +128,15 @@ x = [x;y;theta];
 syms v w;
 u = [v;w];
 
+% Create Symbolic Parameter Variable:
+syms t;
+p = [t];
+
+% Create Symbolic Time Varying Parameter Variable:
+h = [];
+
 % Create Symbolic Continuation Variable:
-c = sym([]);
+c = [];
 
 end
 
@@ -131,57 +148,67 @@ end
 %  Output:
 %    phi - Terminal Cost
 %    L - Running Cost
-function [phi,L] = Cost(System,t,x,u,c)
+function [phi,L] = Cost(System,x,u,p,h,c)
 
 % Terminal Cost:
-phi = 10*t;
+phi = 10*p(1);
 
 % Running Cost:
-L = sym(0); 
+L = 0; 
 
 end
 
-function [f,slack] = Dynamics(System,x,u,c)
+function [f,g,slack] = Dynamics(System,x,u,p,h,c)
 
 
 % Dynamics:
-f = [u(1) * cos(x(3));
-     u(1) * sin(x(3));
-     u(2)];
+f = p(1)*[u(1) * cos(x(3));
+          u(1) * sin(x(3));
+          u(2)];
+
+% Disturbance:
+g = zeros(3,0);
 
 % Define Variables that can be slackened
 slack = [x(1:3)];
 
 end
 
-function [g0] = InitialCondition(System,x0,c)
+function [g0] = InitialCondition(System,x0,u0,p,h0,c)
 
 g0 = x0(1:3) - System.x0;
 
 end
 
-function [gf] = FinalCondition(System,xf,c)
+function [gf] = FinalCondition(System,xf,uf,p,hf,c)
 
 gf = xf(1:3) - System.xf;
 
 end
 
-function [Constraints] = ConvexConstraints(System,x,u,c)
+function [Constraints,Objective,Vars] = Convexities(System,x,u,p,h,c,Vars)
 
-% Nonconvex Inequality Constraint (s <= 0):
-Constraints = [0 <= u(1);
-               u(1) <= System.MaximumVelocity;
-               u(2) <= System.MaximumRotationalRate;
-               -System.MaximumRotationalRate <= u(2);
-               x(1) <= System.MaximumDistance - System.CarRadius;
-               System.MinimumDistance + System.CarRadius <= x(1);
-               x(2) <= System.MaximumDistance - System.CarRadius;
-               System.MinimumDistance + System.CarRadius <= x(2);
-               ];
+% Convex Constraints:
+Constraints = [];
+for k = 1:size(x,2)
+    Constraints = [Constraints;
+                   0 <= u(1,k);
+                   u(1,k) <= System.MaximumVelocity;
+                   u(2,k) <= System.MaximumRotationalRate;
+                   -System.MaximumRotationalRate <= u(2,k);
+                   x(1,k) <= System.MaximumDistance - System.CarRadius;
+                   System.MinimumDistance + System.CarRadius <= x(1,k);
+                   x(2,k) <= System.MaximumDistance - System.CarRadius;
+                   System.MinimumDistance + System.CarRadius <= x(2,k);
+                   ];
+end
+
+% Objective:
+Objective = 0;
 
 end
 
-function [s] = NonConvexConstraints(System,x,u,c)
+function [s] = NonConvexConstraints(System,x,u,p,h,c)
 
 % Nonconvex Inequality Constraint (s <= 0):
 s = [];
@@ -204,7 +231,7 @@ end
 %    umax - Maximum Input Vector
 %    pmin - Minimum Parameter Vector
 %    pmax - Maximum Parameter Vector
-function [xmin,xmax,umin,umax] = Scaling(System)
+function [xmin,xmax,umin,umax,pmin,pmax,hmin,hmax] = Scaling(System)
 
 % State Scaling Limits
 xmin = [System.MinimumDistance;
@@ -221,6 +248,14 @@ umin = [0;
 
 umax = [System.MaximumVelocity;
         System.MaximumRotationalRate];
+
+% Parameter Scaling Limits
+pmin = 0;
+pmax = 1;
+
+% Time Varying Parameter Scaling Limits
+hmin = zeros(0,1);
+hmax = zeros(0,1);
 
 end
 

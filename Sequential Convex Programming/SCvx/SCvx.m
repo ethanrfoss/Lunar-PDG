@@ -5,7 +5,7 @@ function [Solution] = SCvx(SCP,System,InitialGuess,Variables,Cost,Dynamics,Conve
 tic;
 
 % Determine Problem Dimensions
-[dims] = Dimensions(System,SCP,InitialGuess,Variables,Dynamics,NonConvexConstraints,InitialCondition,FinalCondition,Scaling);
+[dims] = Dimensions(System,InitialGuess,Variables,Dynamics,NonConvexConstraints,InitialCondition,FinalCondition,Scaling);
 
 % Initialize Continuation Parameter:
 if dims.nc == 0
@@ -17,30 +17,31 @@ else
 end
 
 % Scaling Matrices:
-[ScalingMatrices] = Scale(SCP,System,Scaling);
+[ScalingMatrices] = Scale(System,Scaling);
 
 % Parse the Problem
 fprintf('Parsing Problem...');
-[ConvexProblemOptimizer] = YalmipParseSCvx(SCP,System,ConvexConstraints,ScalingMatrices,dims);
+[ConvexProblemOptimizer,Fields] = YalmipParseSCvx(SCP,System,ConvexConstraints,ScalingMatrices,dims);
+fprintf('Done\n');
+
+% Find Jacobians
+fprintf('Linearizing Problem...');
+[LinearizedCost,LinearizedDynamics,LinearizedConstraints] = Linearize(System,Variables,Cost,Dynamics,NonConvexConstraints,InitialCondition,FinalCondition);
 fprintf('Done\n');
 
 % Start Iteration:
 disp(['----------- Iteration ' num2str(1) ' -----------']);
 
-% Find Jacobians
-fprintf('Linearizing Problem...');
-[LinearizedCost,LinearizedDynamics,LinearizedConstraints] = Linearize(SCP,System,Variables,Cost,Dynamics,NonConvexConstraints,InitialCondition,FinalCondition);
-fprintf('Done\n');
-
 % Discretize
 fprintf('Discretizing Problem...');
-[DiscreteCost,DiscreteDynamics,DiscreteConstraints,delta] = Discretize(SCP,System,InitialGuess,LinearizedCost,LinearizedDynamics,LinearizedConstraints,dims);
+[DiscreteCost,DiscreteDynamics,DiscreteConstraints,delta] = Discretize(SCP,InitialGuess,LinearizedCost,LinearizedDynamics,LinearizedConstraints,dims);
 fprintf('Done\n');
 
 % Initialize First Solution
 Solution{1} = InitialGuess;
 Solution{1}.Tolerance = NaN;
 Solution{1}.delta = delta;
+Solution{1}.Trajectory = DiscreteDynamics.Trajectory;
 
 % Nonlinear Cost:
 Solution{1}.J = NonLinearCost(SCP,InitialGuess,LinearizedCost,LinearizedConstraints,delta,dims);
@@ -55,13 +56,22 @@ while true
     
     % Solve Problem
     fprintf('Solving Convex Subproblem..');
-    [Solution{SolutionIterate}] = ConvexSolve(SCP,Solution{SolutionIterate-1},ConvexProblemOptimizer,DiscreteCost,DiscreteDynamics,DiscreteConstraints,dims);
+    [Solution{SolutionIterate}] = ConvexSolve(SCP,Solution{SolutionIterate-1},ConvexProblemOptimizer,DiscreteCost,DiscreteDynamics,DiscreteConstraints,Fields,dims);
     fprintf('Done\n');
 
+    % Redescretize with solution
+    fprintf('Discretizing Problem...');
+    [NewDiscreteCost,NewDiscreteDynamics,NewDiscreteConstraints,delta] = Discretize(SCP,Solution{SolutionIterate},LinearizedCost,LinearizedDynamics,LinearizedConstraints,dims);
+    fprintf('Done\n');
+
+    % Add solution Variables:
+    Solution{SolutionIterate}.delta = delta;
+    Solution{SolutionIterate}.Trajectory = DiscreteDynamics.Trajectory;
+
     % Check Convergence Criterion
-    Solution{SolutionIterate}.Tolerance = Solution{SolutionIterate-1}.J-Solution{SolutionIterate}.L;
+    Solution{SolutionIterate}.Tolerance = abs(Solution{SolutionIterate-1}.J-Solution{SolutionIterate}.L);
     Solution{SolutionIterate}.InfeasibilityTolerance = max(vecnorm(delta));
-    if abs(Solution{SolutionIterate}.Tolerance) <= SCP.Tolerance && gamma == 1 && Solution{SolutionIterate}.InfeasibilityTolerance <= SCP.InfeasibilityTolerance
+    if Solution{SolutionIterate}.Tolerance <= SCP.Tolerance && gamma == 1 && Solution{SolutionIterate}.InfeasibilityTolerance <= SCP.InfeasibilityTolerance
         disp(['SCP Algorithm Converged in ' num2str(toc) ' seconds']);
         break;
     else
@@ -72,11 +82,6 @@ while true
         disp(['Maximum Iteration Count Reached. Current Tolerance: ' num2str(Solution{SolutionIterate}.Tolerance)]); %num2str(norm(pstar-pbar,2) + max(vecnorm(xstar-xbar)))]);
         break
     end
-    
-    % Redescretize with solution
-    fprintf('Discretizing Problem...');
-    [NewDiscreteCost,NewDiscreteDynamics,NewDiscreteConstraints,delta] = Discretize(SCP,System,Solution{SolutionIterate},LinearizedCost,LinearizedDynamics,LinearizedConstraints,dims);
-    fprintf('Done\n');
 
     % New Nonlinear Cost
     Solution{SolutionIterate}.J = NonLinearCost(SCP,Solution{SolutionIterate},LinearizedCost,LinearizedConstraints,delta,dims);
@@ -116,30 +121,25 @@ end
 
 function J = NonLinearCost(SCP,Solution,LinearizedCost,LinearizedConstraints,delta,dims)
 
-% Final Time:
-if SCP.FreeTime && ~SCP.AdaptiveMesh
-    T = Solution.p;
-elseif SCP.AdaptiveMesh
-    T = sum(Solution.h);
-else
-    T = System.T;
-end
-
 % Terminal Cost:
 % Basic Terminal Cost:
-phi = LinearizedCost.phi(T,Solution.x(:,dims.N),Solution.c); 
+phi = LinearizedCost.phi(Solution.x(:,dims.N),Solution.u(:,dims.N),Solution.p,Solution.h(:,end),Solution.c); 
 % Augmented Terminal Cost:
-phi = phi + SCP.lambdaic*norm(LinearizedConstraints.g0(Solution.x(:,1)),2) + SCP.lambdatc*norm(LinearizedConstraints.gf(Solution.x(:,dims.N)),2);
+g0 = LinearizedConstraints.g0(Solution.x(:,1),Solution.u(:,1),Solution.p,Solution.h(:,1),Solution.c);
+gf = LinearizedConstraints.gf(Solution.x(:,end),Solution.u(:,end),Solution.p,Solution.h(:,end),Solution.c);
+phi = phi + SCP.lambdaic*norm(g0,2) + SCP.lambdatc*norm(gf,2);
 
 % Running Cost:
 L = 0;
-for k = 1:dims.N-1
+for k = 1:dims.N
     % Basic Running Cost:
-    L = L + 1/dims.N*LinearizedCost.L(T,Solution.x(:,k),Solution.u(:,k),Solution.c);
+    L = L + 1/dims.N*LinearizedCost.L(Solution.x(:,k),Solution.u(:,k),Solution.p,Solution.h(:,k),Solution.c);
     % Augmented Running Cost:
-    L = L + 1/dims.N*(SCP.lambda*norm(delta(:,k),1));
+    if k < dims.N
+        L = L + 1/dims.N*(SCP.lambda*norm(delta(:,k),1));
+    end
     if dims.ns ~= 0
-        L = L + 1/dims.N*(SCP.lambdas*sum(max(0,LinearizedConstraints.s(Solution.x(:,k),Solution.u(:,k))),1));
+        L = L + 1/dims.N*(SCP.lambdas*sum(max(0,LinearizedConstraints.s(Solution.x(:,k),Solution.u(:,k),Solution.p,Solution.h(:,k),Solution.c)),1));
     end
 end
 
@@ -148,14 +148,14 @@ J = phi + L;
 
 end
 
-function [dims] = Dimensions(System,SCP,InitialGuess,Variables,Dynamics,NonConvexConstraints,InitialCondition,FinalCondition,Scaling)
+function [dims] = Dimensions(System,InitialGuess,Variables,Dynamics,NonConvexConstraints,InitialCondition,FinalCondition,Scaling)
 
-[x,u,c] = Variables(System);
-[f,slack] = Dynamics(System,x,u,c);
-[s] = NonConvexConstraints(System,x,u,c);
-[g0] = InitialCondition(System,x,c);
-[gf] = FinalCondition(System,x,c);
-[xmin,xmax,umin,umax] = Scaling(System);
+[x,u,p,h,c] = Variables(System);
+[f,g,slack] = Dynamics(System,x,u,p,h,c);
+[s] = NonConvexConstraints(System,x,u,p,h,c);
+[g0] = InitialCondition(System,x,u,p,h,c);
+[gf] = FinalCondition(System,x,u,p,h,c);
+[xmin,xmax,umin,umax,pmin,pmax,hmin,hmax] = Scaling(System);
 
 dims.nx = length(x);
 if length(f) ~= dims.nx || size(InitialGuess.x,1) ~= dims.nx || length(xmin) ~= dims.nx || length(xmax) ~= dims.nx
@@ -167,30 +167,27 @@ if size(InitialGuess.u,1) ~= dims.nu || length(umin) ~= dims.nu || length(umax) 
     error('Incommensurate Dimensions specified for Input');
 end
 
+dims.np = length(p);
+if length(InitialGuess.p) ~= dims.np || length(pmin) ~= dims.np || length(pmax) ~= dims.np
+    error('Incommensurate Dimensions Specified for Parameter');
+end
+
+dims.nh = length(h);
+if size(InitialGuess.h,1) ~= dims.nh || length(hmin) ~= dims.nh || length(hmax) ~= dims.nh
+    error('Incommensurate Dimensions Specified for Time-Varying Parameter');
+end
+
+dims.ng = size(g,2);
+
 dims.N = size(InitialGuess.x,2);
-if size(InitialGuess.u,2) ~= dims.N
+if size(InitialGuess.x,2) ~= dims.N || size(InitialGuess.u,2) ~= dims.N || size(InitialGuess.h,2) ~= dims.N
     error('Incommensurate Dimensions specified for Nodes');
 end
 
 dims.nc = length(c);
-
 dims.nic = length(g0);
 dims.ntc = length(gf);
 dims.nv = length(slack);
 dims.ns = length(s);
-
-if SCP.FreeTime && ~SCP.AdaptiveMesh
-    if ~isfield(InitialGuess,'p')
-        error('No Initial Time Guess Specified for Free Final Time Problem');
-    end
-end
-if SCP.AdaptiveMesh
-    if ~isfield(InitialGuess,'h')
-        error('No Initial Mesh Guess Specified for Problem');
-    end
-    if length(InitialGuess.h) ~= dims.N-1
-        error('Incommensurate Dimensions specified for initial mesh');
-    end
-end
 
 end
